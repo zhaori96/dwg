@@ -18,6 +18,8 @@ type DynamicWaitGroup struct {
 	lockCounter    int
 	locked         bool
 	blocked        bool
+
+	isShuttingDown bool
 	closed         chan struct{}
 }
 
@@ -46,6 +48,10 @@ func (d *DynamicWaitGroup) Closed() bool {
 	default:
 		return false
 	}
+}
+
+func (d *DynamicWaitGroup) IsShuttingDown() bool {
+	return d.isShuttingDown
 }
 
 // Add increments or decrements the task counter by delta.
@@ -170,6 +176,7 @@ func (d *DynamicWaitGroup) Close() {
 // Shutdown locks and closes the group, ensuring no new tasks can be added
 // and that the group is closed after current tasks finish.
 func (d *DynamicWaitGroup) Shutdown() {
+	d.isShuttingDown = true
 	d.Lock()
 	d.Close()
 }
