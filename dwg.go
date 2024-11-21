@@ -179,6 +179,7 @@ func (d *DynamicWaitGroup) Shutdown() {
 	d.isShuttingDown = true
 	d.Lock()
 	d.Close()
+	d.isShuttingDown = false
 }
 
 // addWaiting adjusts the waiting counter by the given value.
