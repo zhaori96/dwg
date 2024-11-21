@@ -2,6 +2,7 @@ package dwg
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -12,6 +13,11 @@ import (
 type DynamicWaitGroup struct {
 	mutex sync.Mutex
 	cond  *sync.Cond
+
+	id              int
+	parent          *DynamicWaitGroup
+	children        map[int]*DynamicWaitGroup
+	childrenCounter int
 
 	taskCounter    int
 	waitingCounter int
@@ -54,6 +60,34 @@ func (d *DynamicWaitGroup) IsShuttingDown() bool {
 	return d.isShuttingDown
 }
 
+func (d *DynamicWaitGroup) HasParent() bool {
+	return d.parent != nil
+}
+
+func (d *DynamicWaitGroup) HasChildren() bool {
+	return len(d.children) > 0
+}
+
+func (d *DynamicWaitGroup) TotalChildren() int {
+	return len(d.children)
+}
+
+func (d *DynamicWaitGroup) NewChild() *DynamicWaitGroup {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	if d.children == nil {
+		d.children = make(map[int]*DynamicWaitGroup)
+	}
+
+	d.childrenCounter++
+	child := NewDynamicWaitGroup()
+	child.parent = d
+	child.id = d.childrenCounter
+	d.children[child.id] = child
+	return child
+}
+
 // Add increments or decrements the task counter by delta.
 // If delta is positive, it adds tasks; if negative, it removes tasks.
 // It blocks if the group is locked or if there are goroutines waiting.
@@ -62,6 +96,10 @@ func (d *DynamicWaitGroup) IsShuttingDown() bool {
 func (d *DynamicWaitGroup) Add(delta int) bool {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
+
+	if d.isShuttingDown {
+		return false
+	}
 
 	if d.taskCounter+delta < 0 {
 		panic("DynamicWaitGroup: Add(delta) would result in a negative task counter")
@@ -144,12 +182,29 @@ func (d *DynamicWaitGroup) Unlock() {
 		d.blocked = false
 	}
 
+	if d.HasChildren() {
+		d.unlockChildren()
+	}
+
 	d.addLock(-1)
 	if d.lockCounter == 0 {
 		d.locked = false
 	}
 
 	d.cond.Broadcast()
+}
+
+func (d *DynamicWaitGroup) Pause() context.CancelFunc {
+	return d.PauseContext(context.Background())
+}
+
+func (d *DynamicWaitGroup) PauseContext(ctx context.Context) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+	go d.LockContext(ctx)
+	return func() {
+		defer d.Unlock()
+		cancel()
+	}
 }
 
 // Close closes the DynamicWaitGroup, preventing further operations.
@@ -165,11 +220,20 @@ func (d *DynamicWaitGroup) Close() {
 	close(d.closed)
 	d.cond.Broadcast()
 
+	if d.HasParent() {
+		delete(d.parent.children, d.id)
+	}
+
+	if d.HasChildren() {
+		d.closeChildren()
+	}
+
 	d.taskCounter = 0
 	d.lockCounter = 0
 	d.waitingCounter = 0
 	d.blocked = false
 	d.locked = false
+	d.parent = nil
 	d.cond = nil
 }
 
@@ -177,6 +241,10 @@ func (d *DynamicWaitGroup) Close() {
 // and that the group is closed after current tasks finish.
 func (d *DynamicWaitGroup) Shutdown() {
 	d.isShuttingDown = true
+	if d.HasChildren() {
+		d.shutdownChildren()
+	}
+
 	d.Lock()
 	d.Close()
 	d.isShuttingDown = false
@@ -210,17 +278,18 @@ func (d *DynamicWaitGroup) wait(
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	var canceled bool
-
 	d.addWaiting(1)
-	defer d.addWaiting(-1)
-
 	d.blocked = true
 	if mustLock {
 		d.addLock(1)
 		d.locked = true
 	}
 
+	if d.HasChildren() {
+		d.waitChildren(ctx, shouldUnblock, mustLock)
+	}
+
+	var canceled bool
 	var err error
 	for d.taskCounter > 0 && !canceled {
 		select {
@@ -228,19 +297,18 @@ func (d *DynamicWaitGroup) wait(
 			err = ctx.Err()
 			canceled = true
 		case <-d.closed:
+			d.addWaiting(-1)
 			return nil
 		default:
 			d.cond.Wait()
 		}
 	}
 
-	if mustLock && canceled {
-		d.addLock(-1)
-		if d.lockCounter == 0 {
-			d.locked = false
-		}
+	if mustLock && canceled && d.lockCounter == 0 {
+		d.locked = false
 	}
 
+	d.addWaiting(-1)
 	if shouldUnblock && d.waitingCounter == 0 && !d.locked {
 		d.blocked = false
 	}
@@ -258,8 +326,8 @@ func (d *DynamicWaitGroup) waitContext(
 ) error {
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		d.wait(ctx, shouldUnblock, mustLock)
-		close(done)
 	}()
 
 	select {
@@ -271,4 +339,65 @@ func (d *DynamicWaitGroup) waitContext(
 	case <-done:
 		return nil
 	}
+}
+
+func (d *DynamicWaitGroup) waitChildren(
+	ctx context.Context,
+	shouldUnblock bool,
+	mustLock bool,
+) error {
+	wg := sync.WaitGroup{}
+	wg.Add(d.TotalChildren())
+	errs := []error{}
+	for _, child := range d.children {
+		go func() {
+			defer wg.Done()
+			if err := child.wait(ctx, shouldUnblock, mustLock); err != nil {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+func (d *DynamicWaitGroup) unlockChildren() {
+	wg := sync.WaitGroup{}
+	wg.Add(d.TotalChildren())
+	for _, child := range d.children {
+		go func() {
+			defer wg.Done()
+			child.Unlock()
+		}()
+	}
+	wg.Wait()
+}
+
+func (d *DynamicWaitGroup) shutdownChildren() {
+	wg := sync.WaitGroup{}
+	wg.Add(d.TotalChildren())
+
+	for _, child := range d.children {
+		go func() {
+			defer wg.Done()
+			child.Shutdown()
+		}()
+	}
+
+	wg.Wait()
+}
+
+func (d *DynamicWaitGroup) closeChildren() {
+	wg := sync.WaitGroup{}
+	wg.Add(d.TotalChildren())
+
+	for _, child := range d.children {
+		go func() {
+			defer wg.Done()
+			child.Close()
+		}()
+	}
+
+	wg.Wait()
+	clear(d.children)
 }
