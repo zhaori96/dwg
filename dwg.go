@@ -201,10 +201,7 @@ func (d *DynamicWaitGroup) Pause() context.CancelFunc {
 func (d *DynamicWaitGroup) PauseContext(ctx context.Context) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
 	go d.LockContext(ctx)
-	return func() {
-		defer d.Unlock()
-		cancel()
-	}
+	return cancel
 }
 
 // Close closes the DynamicWaitGroup, preventing further operations.
