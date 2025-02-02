@@ -6,6 +6,8 @@ import (
 	"sync"
 )
 
+type UnpauseFunc = context.CancelFunc
+
 // DynamicWaitGroup is a synchronization primitive that extends the capabilities
 // of sync.WaitGroup, allowing dynamic addition and completion of tasks.
 // It provides mechanisms to lock the group, wait for tasks with context cancellation,
@@ -194,11 +196,11 @@ func (d *DynamicWaitGroup) Unlock() {
 	d.cond.Broadcast()
 }
 
-func (d *DynamicWaitGroup) Pause() context.CancelFunc {
+func (d *DynamicWaitGroup) Pause() UnpauseFunc {
 	return d.PauseContext(context.Background())
 }
 
-func (d *DynamicWaitGroup) PauseContext(ctx context.Context) context.CancelFunc {
+func (d *DynamicWaitGroup) PauseContext(ctx context.Context) UnpauseFunc {
 	ctx, cancel := context.WithCancel(ctx)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
