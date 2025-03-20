@@ -209,7 +209,12 @@ func (d *DynamicWaitGroup) PauseContext(ctx context.Context) UnpauseFunc {
 		d.LockContext(ctx)
 	}()
 	wg.Wait()
-	return cancel
+
+	unpauseFunc := func() {
+		cancel()
+		d.Unlock()
+	}
+	return unpauseFunc
 }
 
 // Close closes the DynamicWaitGroup, preventing further operations.
